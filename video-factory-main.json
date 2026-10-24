@@ -1,0 +1,1988 @@
+{
+  "name": "AI Video Factory (Veo 3.1)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "AI Video Request",
+        "formDescription": "Tell me the topic and roughly what you want. Attach documents or images if you have them (brand guide, script, product photos, brief...). I will ask if anything important is missing.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Topic",
+              "fieldType": "text",
+              "requiredField": true,
+              "placeholder": "e.g. 5 tips to sleep better"
+            },
+            {
+              "fieldLabel": "Instructions",
+              "fieldType": "textarea",
+              "placeholder": "Style, audience, must-include points, tone, links..."
+            },
+            {
+              "fieldLabel": "Video type",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Not sure - decide for me"
+                  },
+                  {
+                    "option": "Instagram Reel / TikTok / YouTube Short (vertical)"
+                  },
+                  {
+                    "option": "YouTube / website video (landscape)"
+                  },
+                  {
+                    "option": "Ad / promo (vertical)"
+                  },
+                  {
+                    "option": "Ad / promo (landscape)"
+                  },
+                  {
+                    "option": "Explainer"
+                  },
+                  {
+                    "option": "Cinematic / story clip"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Duration (seconds)",
+              "fieldType": "number",
+              "placeholder": "e.g. 30 - leave empty if unsure"
+            },
+            {
+              "fieldLabel": "Documents / images / media",
+              "fieldType": "file",
+              "multipleFiles": true,
+              "acceptFileTypes": ".pdf,.docx,.pptx,.txt,.md,.csv,.json,.html,.png,.jpg,.jpeg,.webp,.mp4,.mov,.webm,.mp3,.wav,.m4a"
+            },
+            {
+              "fieldLabel": "Your email",
+              "fieldType": "email",
+              "requiredField": true,
+              "placeholder": "Preview + approval request is sent here"
+            }
+          ]
+        },
+        "options": {
+          "buttonLabel": "Create my video",
+          "appendAttribution": false
+        }
+      },
+      "id": "268f77dc-4304-46ac-9a7c-9a3a424f5144",
+      "name": "Video Request",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        360
+      ],
+      "webhookId": "ee1426f1-8297-4bb5-a277-110d120cfeda"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===================== GLOBAL SETTINGS (edit here) =====================\nconst CFG = {\n  baseDir: '/home/node/.n8n-files/video-jobs', // must exist/writable inside the n8n container\n  textModel: 'gemini-3.8-flash',\n  textModelFallback: 'gemini-3.5-flash',\n  imageModel: 'gemini-3.1-flash-image-preview',\n  qualityProfile: 'quality',   // 'quality' = Veo 3.1 -> Fast -> Lite -> still-image ; 'economy' = Fast -> Lite -> still-image\n  resolution: '720p',          // '720p' | '1080p' | '4k'  (1080p/4k force 8 s clips)\n  fps: 24,\n  maxScenes: 12,\n  maxDurationSec: 120,\n  maxFailedScenes: 1,          // abort the job if more scenes than this cannot be rendered\n  clarifyRoundsMax: 2,         // max \"please tell me more\" emails\n  revisionRoundsMax: 2,        // max human \"needs changes\" loops\n  autoFixRoundsMax: 1,         // max automatic QA-driven re-renders\n  qaPassScore: 7,              // 0-10\n  enableResearch: true,        // Gemini + Google Search grounding\n  burnCaptions: true,\n  scenePaceSec: 8,             // pause before each Veo submit (rate-limit friendliness)\n  pollIntervalSec: 15,\n  maxPollMinutes: 12,\n  backoffBaseSec: 15,\n  backoffMaxSec: 60,\n  maxSubmitRetriesPerTier: 6,\n  maxPromptSoftenings: 1,\n  cleanupAfter: true,\n  adminEmail: '',              // optional: gets failure alerts; defaults to requester\n  driveParentFolderId: 'root'  // Google Drive folder ID where job folders are created\n};\n// ======================================================================\nconst T = {\n  std:   { model: 'veo-3.1-generate-preview',       supportsRefs: true,  maxRes: '4k' },\n  fast:  { model: 'veo-3.1-fast-generate-preview',  supportsRefs: true,  maxRes: '4k' },\n  lite:  { model: 'veo-3.1-lite-generate-preview',  supportsRefs: false, maxRes: '1080p' },\n  still: { model: 'still' }\n};\nconst tiers = CFG.qualityProfile === 'economy' ? [T.fast, T.lite, T.still] : [T.std, T.fast, T.lite, T.still];\n\nconst item = $input.first();\nconst f = item.json || {};\nconst pick = (prefix) => {\n  const k = Object.keys(f).find((x) => x.toLowerCase().startsWith(prefix));\n  return k ? f[k] : '';\n};\nconst topic = String(pick('topic') || '').trim();\nconst instructions = String(pick('instructions') || '').trim();\nlet typeHint = String(pick('video type') || '').trim();\nif (/^not sure/i.test(typeHint)) typeHint = '';\nconst dur = Number(pick('duration'));\nconst email = String(pick('your email') || pick('email') || '').trim();\nif (!topic) throw new Error('Topic is required.');\nif (!email) throw new Error('Email is required (needed for review/approval).');\n\nconst jobId = 'job_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);\nconst urls = Array.from(new Set(((topic + ' ' + instructions).match(/https?:\\/\\/[^\\s)>\"']+/g)) || []));\n\nconst job = {\n  jobId,\n  jobDir: CFG.baseDir + '/' + jobId,\n  createdAt: new Date().toISOString(),\n  requesterEmail: email,\n  adminEmail: CFG.adminEmail || email,\n  topic,\n  instructions,\n  videoTypeHint: typeHint,\n  durationHintSec: Number.isFinite(dur) && dur > 0 ? dur : null,\n  urls,\n  answers: [],\n  clarifyRound: 0,\n  revisionRound: 0,\n  autoFixRound: 0,\n  revisionNotes: [],\n  clips: {},\n  cfg: CFG,\n  tiers\n};\nreturn [{ json: job, binary: item.binary || {} }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "7c3465f2-a4eb-445c-b19a-cf0d40a40a02",
+      "name": "Init Job",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst zlib = require('zlib');\nconst helpers = this.helpers;\nconst src = $input.first();\nconst job = { ...src.json };\nconst bin = src.binary || {};\nconst dir = job.jobDir;\n['in', 'clips', 'work', 'out'].forEach((d) => fs.mkdirSync(dir + '/' + d, { recursive: true }));\n\nconst MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', pdf: 'application/pdf',\n  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4' };\nconst IMG = ['png', 'jpg', 'jpeg', 'webp'];\nconst MEDIA = ['mp4', 'mov', 'webm', 'mp3', 'wav', 'm4a'];\nconst TEXT = ['txt', 'md', 'csv', 'json', 'html', 'htm', 'xml', 'srt', 'vtt'];\nconst INLINE_EACH = 8 * 1024 * 1024, INLINE_TOTAL = 14 * 1024 * 1024, TEXT_TOTAL = 150000;\n\nfunction unzipEntries(buf, wanted) {\n  let eocd = -1;\n  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {\n    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }\n  }\n  if (eocd < 0) return [];\n  const count = buf.readUInt16LE(eocd + 10);\n  let off = buf.readUInt32LE(eocd + 16);\n  const out = [];\n  for (let n = 0; n < count; n++) {\n    if (buf.readUInt32LE(off) !== 0x02014b50) break;\n    const method = buf.readUInt16LE(off + 10);\n    const csize = buf.readUInt32LE(off + 20);\n    const nlen = buf.readUInt16LE(off + 28), elen = buf.readUInt16LE(off + 30), clen = buf.readUInt16LE(off + 32);\n    const lho = buf.readUInt32LE(off + 42);\n    const name = buf.toString('utf8', off + 46, off + 46 + nlen);\n    if (wanted(name)) {\n      const start = lho + 30 + buf.readUInt16LE(lho + 26) + buf.readUInt16LE(lho + 28);\n      const raw = buf.subarray(start, start + csize);\n      out.push({ name, data: method === 0 ? raw : zlib.inflateRawSync(raw) });\n    }\n    off += 46 + nlen + elen + clen;\n  }\n  return out;\n}\nconst decode = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&apos;/g, \"'\").replace(/&amp;/g, '&');\nfunction docxText(buf) {\n  const e = unzipEntries(buf, (n) => n === 'word/document.xml')[0];\n  if (!e) return '';\n  return decode(e.data.toString('utf8').replace(/<w:tab\\/>/g, '\\t').replace(/<\\/w:p>/g, '\\n').replace(/<[^>]+>/g, ''));\n}\nfunction pptxText(buf) {\n  const es = unzipEntries(buf, (n) => /^ppt\\/slides\\/slide\\d+\\.xml$/.test(n))\n    .sort((a, b) => parseInt(a.name.match(/(\\d+)\\.xml/)[1]) - parseInt(b.name.match(/(\\d+)\\.xml/)[1]));\n  return es.map((e, i) => 'Slide ' + (i + 1) + ':\\n' + decode(e.data.toString('utf8').replace(/<\\/a:p>/g, '\\n').replace(/<[^>]+>/g, ''))).join('\\n\\n');\n}\n\nconst files = [], inlineParts = [], warnings = [];\nlet inlineBytes = 0, textChars = 0;\nconst used = new Set();\nconst keys = Object.keys(bin);\nfor (let i = 0; i < keys.length; i++) {\n  const k = keys[i], b = bin[k];\n  const orig = String(b.fileName || k);\n  const ext = String(b.fileExtension || orig.split('.').pop() || '').toLowerCase();\n  let safe = orig.replace(/[^A-Za-z0-9._-]+/g, '_') || ('file_' + i);\n  if (!/\\.[A-Za-z0-9]+$/.test(safe)) safe += '.' + ext;\n  if (used.has(safe)) safe = (i + 1) + '_' + safe;\n  used.add(safe);\n  const buf = await helpers.getBinaryDataBuffer(0, k);\n  const path = dir + '/in/' + safe;\n  fs.writeFileSync(path, buf);\n  const rec = { name: safe, originalName: orig, path, ext, bytes: buf.length, kind: 'other' };\n  try {\n    if (IMG.includes(ext)) rec.kind = 'image';\n    else if (ext === 'pdf') rec.kind = 'doc';\n    else if (MEDIA.includes(ext)) rec.kind = 'media';\n    else if (ext === 'docx') { rec.kind = 'doc'; rec.text = docxText(buf); }\n    else if (ext === 'pptx') { rec.kind = 'doc'; rec.text = pptxText(buf); }\n    else if (TEXT.includes(ext)) { rec.kind = 'doc'; rec.text = buf.toString('utf8'); }\n    else warnings.push('Unsupported file type ignored for analysis: ' + safe);\n  } catch (e) { warnings.push('Could not read ' + safe + ': ' + e.message); }\n  if (rec.text) {\n    rec.text = rec.text.slice(0, 60000);\n    if (textChars + rec.text.length > TEXT_TOTAL) { rec.text = rec.text.slice(0, Math.max(0, TEXT_TOTAL - textChars)); warnings.push('Text truncated for ' + safe); }\n    textChars += rec.text.length;\n  }\n  if (MIME[ext] && ['image', 'media'].includes(rec.kind) || ext === 'pdf') {\n    if (buf.length <= INLINE_EACH && inlineBytes + buf.length <= INLINE_TOTAL) {\n      inlineParts.push({ text: '[Attached file: ' + safe + ']' });\n      inlineParts.push({ inline_data: { mime_type: MIME[ext], data: buf.toString('base64') } });\n      inlineBytes += buf.length;\n      rec.inlined = true;\n    } else warnings.push(safe + ' is too large to analyse inline (kept on disk; images can still be used as Veo references).');\n  }\n  files.push(rec);\n}\njob.assets = { files, warnings };\nfs.writeFileSync(dir + '/job.json', JSON.stringify({ ...job }, null, 2));\nreturn [{ json: { ...job, inlineParts } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "76c39195-6798-4fa1-83ac-51e293b72627",
+      "name": "Process Uploads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst files = (j.assets && j.assets.files) || [];\nconst docText = files.filter((f) => f.text).map((f) => '### FILE: ' + f.name + '\\n' + f.text).join('\\n\\n').slice(0, 120000);\nconst answers = (j.answers || []).map((a, i) => 'Clarification round ' + (i + 1) + ' answers: ' + JSON.stringify(a)).join('\\n');\nconst known = j.assetSummaries && j.assetSummaries.length ? 'Previously analysed attachments: ' + JSON.stringify(j.assetSummaries) : '';\nconst prompt = `You are the INTAKE ANALYST of an automated AI video studio (clips are made with Google Veo 3.1: 4/6/8-second clips with native audio, stitched together).\nDecide whether the request contains enough information to start production, and normalise it into a spec.\n\nUSER REQUEST\nTopic: ${j.topic}\nInstructions: ${j.instructions || '(none)'}\nVideo type hint: ${j.videoTypeHint || '(none)'}\nDuration hint (seconds): ${j.durationHintSec || '(none)'}\nURLs mentioned: ${(j.urls || []).join(', ') || '(none)'}\n${answers}\n${known}\n${(j.assets && j.assets.warnings || []).join('\\n')}\n\nATTACHED DOCUMENT TEXT\n${docText || '(none)'}\n\nRULES\n- A request is COMPLETE when you can confidently determine: purpose/video type, platform or format (-> aspect ratio), target duration, language, and tone/style. Infer when the wording makes it obvious (e.g. \"reel\" => 9:16, \"YouTube explainer\" => 16:9); otherwise list it as missing.\n- Duration and format/platform MUST be known or explicitly inferable; if not, mark incomplete and ask.\n- Ask at most 4 short, concrete questions. Never ask for something already answered or visible in the attachments.\n- Maximum allowed duration is ${j.cfg.maxDurationSec} seconds.\n- For each attachment, describe what it contains and the best use: reference (keep subject/character/product look), first_frame, logo, background_info, or ignore.\n\nReturn ONLY JSON with exactly this shape:\n{\"complete\":boolean,\n \"missing\":[{\"field\":\"duration|platform|language|style|audience|goal|other\",\"question\":\"...\"}],\n \"spec\":{\"title\":\"\",\"videoType\":\"reel|short|tiktok|ad|explainer|cinematic|story|other\",\"platform\":\"\",\"aspectRatio\":\"9:16|16:9\",\"durationSec\":number,\"language\":\"\",\"tone\":\"\",\"style\":\"\",\"audience\":\"\",\"goal\":\"\",\"cta\":\"\",\"captions\":boolean,\"mustInclude\":[],\"avoid\":[]},\n \"assetSummaries\":[{\"name\":\"\",\"description\":\"\",\"bestUse\":\"\"}],\n \"assumptions\":[\"\"]}`;\nconst parts = [{ text: prompt }].concat(j.inlineParts || []);\nconst reqBody = { contents: [{ role: 'user', parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0.2 } };\nreturn [{ json: { ...j, model: j.cfg.textModel, reqBody } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "df3be35a-24af-4b3b-ada7-3439ab461978",
+      "name": "Build Intake Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + $json.model + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reqBody) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "20ae49a1-e026-4b58-b69f-17a624efedc6",
+      "name": "Intake Analyst",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const req = $('Build Intake Request').first().json;\nconst r = $input.first().json || {};\nconst job = { ...req };\ndelete job.reqBody; delete job.inlineParts; delete job.model;\n\nfunction parseJson(t) {\n  t = String(t || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n  try { return JSON.parse(t); } catch (e) {\n    const a = t.indexOf('{'), b = t.lastIndexOf('}');\n    if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));\n    throw e;\n  }\n}\nlet parsed = null, failure = '';\ntry {\n  if (r.error || !r.candidates) throw new Error(typeof r.error === 'string' ? r.error : JSON.stringify(r.error || r).slice(0, 300));\n  const text = (r.candidates[0].content.parts || []).map((p) => p.text || '').join('');\n  parsed = parseJson(text);\n} catch (e) { failure = e.message; }\n\nif (!parsed) {\n  parsed = { complete: false, missing: [{ field: 'other', question: 'Please describe the video type/platform, target duration and language.' }], spec: {}, assetSummaries: [], assumptions: ['Intake analysis failed (' + failure + ')'] };\n}\nconst spec = { ...(job.spec || {}), ...(parsed.spec || {}) };\nif (!job.assetSummaries || !job.assetSummaries.length) job.assetSummaries = parsed.assetSummaries || [];\nelse if (parsed.assetSummaries && parsed.assetSummaries.length) job.assetSummaries = parsed.assetSummaries;\n\nconst typ = String(spec.videoType || job.videoTypeHint || '').toLowerCase();\nconst vertical = /reel|short|tiktok|story|vertical|ad/.test(typ) || /instagram|tiktok|shorts/i.test(String(spec.platform || ''));\nlet complete = !!parsed.complete && Number(spec.durationSec) > 0 && !!spec.aspectRatio;\nconst proceed = complete || (job.clarifyRound >= job.cfg.clarifyRoundsMax);\n\nconst assumptions = parsed.assumptions || [];\nif (proceed) {\n  if (!(Number(spec.durationSec) > 0)) {\n    spec.durationSec = job.durationHintSec || (/explainer/.test(typ) ? 60 : /cinematic/.test(typ) ? 24 : 30);\n    assumptions.push('Duration not specified; assumed ' + spec.durationSec + 's.');\n  }\n  if (!spec.aspectRatio) { spec.aspectRatio = vertical ? '9:16' : '16:9'; assumptions.push('Aspect ratio assumed ' + spec.aspectRatio + '.'); }\n}\nif (spec.durationSec) spec.durationSec = Math.max(4, Math.min(job.cfg.maxDurationSec, Math.round(Number(spec.durationSec))));\nif (spec.aspectRatio !== '9:16' && spec.aspectRatio !== '16:9') spec.aspectRatio = vertical ? '9:16' : '16:9';\nif (!spec.title) spec.title = job.topic.slice(0, 80);\nif (spec.captions === undefined) spec.captions = job.cfg.burnCaptions;\n\njob.spec = spec;\njob.missing = proceed ? [] : (parsed.missing && parsed.missing.length ? parsed.missing : [{ field: 'other', question: 'Please add any missing details (duration, platform, language, style).' }]);\njob.assumptions = assumptions;\njob.proceed = proceed;\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "d804ce45-4d36-4e3d-b42b-64d2e5d1226a",
+      "name": "Parse Intake",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.proceed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "49088b51-53ec-450e-892c-313b95bf819b"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "11c50846-1a40-423f-a697-ce51d63c8f2a",
+      "name": "Info Complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1560,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendAndWait",
+        "sendTo": "={{ $json.requesterEmail }}",
+        "subject": "={{ 'Quick questions about your video: ' + $json.topic.slice(0, 60) }}",
+        "message": "={{ 'Hi,\\n\\nBefore I start producing your video (\"' + $json.topic + '\") I need a few details:\\n\\n' + $json.missing.map((m, i) => (i + 1) + '. ' + m.question).join('\\n') + '\\n\\n' + (($json.assumptions || []).length ? 'What I understood / would assume so far:\\n- ' + $json.assumptions.join('\\n- ') + '\\n\\n' : '') + 'Open the form with the button below and fill in what you know. Anything left empty I will decide myself.' }}",
+        "responseType": "customForm",
+        "options": {
+          "appendAttribution": false,
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 24,
+              "resumeUnit": "hours"
+            }
+          }
+        },
+        "defineForm": "fields",
+        "formTitle": "A few details for your video",
+        "formDescription": "Answer what you can - empty fields are decided by me.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Video type",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Instagram Reel / TikTok / YouTube Short (vertical 9:16)"
+                  },
+                  {
+                    "option": "YouTube / website video (landscape 16:9)"
+                  },
+                  {
+                    "option": "Ad / promo (vertical 9:16)"
+                  },
+                  {
+                    "option": "Ad / promo (landscape 16:9)"
+                  },
+                  {
+                    "option": "Explainer"
+                  },
+                  {
+                    "option": "Cinematic / story clip"
+                  },
+                  {
+                    "option": "Other - described below"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Duration (seconds)",
+              "fieldType": "number"
+            },
+            {
+              "fieldLabel": "Language",
+              "fieldType": "text",
+              "placeholder": "Language of speech and on-screen text"
+            },
+            {
+              "fieldLabel": "Answers to my questions / extra details",
+              "fieldType": "textarea",
+              "requiredField": true
+            }
+          ]
+        }
+      },
+      "id": "8991dd88-a2f4-4255-ba1a-da74bec29c82",
+      "name": "Ask Missing Info",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1560,
+        720
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "fae53354-c3d2-4b53-a884-58522da76d43"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Parse Intake').first().json;\nconst resp = $input.first().json || {};\nconst d = resp.data;\nif (!d || typeof d !== 'object') {\n  throw new Error('No reply to the clarification email within the wait limit - job ' + prev.jobId + ' cancelled.');\n}\nconst job = { ...prev };\ndelete job.missing; delete job.proceed;\njob.answers = [...(prev.answers || []), d];\njob.clarifyRound = (prev.clarifyRound || 0) + 1;\nconst val = (p) => { const k = Object.keys(d).find((x) => x.toLowerCase().startsWith(p)); return k ? String(d[k] || '').trim() : ''; };\nconst t = val('video type'), dur = Number(val('duration'));\nif (t && !/^not sure|other/i.test(t)) job.videoTypeHint = t;\nif (Number.isFinite(dur) && dur > 0) job.durationHintSec = dur;\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "661639ca-bd00-4f98-8a29-0c66cc9c18d9",
+      "name": "Merge Answers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.cfg.enableResearch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "268f8cc5-f4cf-4b4a-bcdc-a9bd1d66932d"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b68f460b-f45d-4c9d-a548-40f2cb9d4de4",
+      "name": "Research Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1820,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst tools = [{ google_search: {} }];\nif ((j.urls || []).length) tools.push({ url_context: {} });\nconst docs = ((j.assets && j.assets.files) || []).filter((f) => f.text).map((f) => f.name + ': ' + f.text.slice(0, 1500)).join('\\n');\nconst prompt = `You are a research assistant for a video production team. Use Google Search${(j.urls || []).length ? ' and the provided URLs' : ''} to collect accurate, current information for the video below.\n\nTOPIC: ${j.topic}\nINSTRUCTIONS: ${j.instructions || '(none)'}\nVIDEO SPEC: ${JSON.stringify(j.spec)}\nURLS: ${(j.urls || []).join(', ') || '(none)'}\nUSER DOCUMENT EXCERPTS (treat as primary source of truth): ${docs || '(none)'}\n\nReply in plain text with these sections: KEY FACTS (with numbers/dates), WHAT THE AUDIENCE CARES ABOUT, COMMON MISCONCEPTIONS, TERMS/NAMES TO GET RIGHT, VISUAL REFERENCES AND SETTINGS, TRUSTWORTHY SOURCES.\nIf the topic is purely fictional, creative or brand-internal and needs no external facts, reply exactly: NO_RESEARCH_NEEDED\nMaximum 600 words.`;\nconst reqBody = { contents: [{ role: 'user', parts: [{ text: prompt }] }], tools, generationConfig: { temperature: 0.3 } };\nreturn [{ json: { ...j, model: j.cfg.textModel, reqBody } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "0fc0a86c-7faf-48ad-8548-c79740521224",
+      "name": "Build Research Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + $json.model + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reqBody) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "1be69204-a636-4fcf-8deb-6334adad3596",
+      "name": "Research (Google Search)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2340,
+        180
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const req = $('Build Research Request').first().json;\nconst r = $input.first().json || {};\nconst job = { ...req };\ndelete job.reqBody; delete job.model;\nlet text = '', sources = [];\ntry {\n  const c = r.candidates && r.candidates[0];\n  text = ((c && c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();\n  const chunks = (c && c.groundingMetadata && c.groundingMetadata.groundingChunks) || [];\n  sources = chunks.filter((x) => x.web).map((x) => ({ title: x.web.title, url: x.web.uri })).slice(0, 12);\n} catch (e) { /* research is best-effort */ }\nif (/^NO_RESEARCH_NEEDED/i.test(text)) text = '';\njob.research = { text, sources, ok: !!text };\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "4a22d3a3-ffff-4633-b6d5-8fae131568b9",
+      "name": "Parse Research",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst cfg = j.cfg, spec = j.spec;\nconst hiRes = cfg.resolution !== '720p';\nconst files = (j.assets && j.assets.files) || [];\nconst sum = (n) => (j.assetSummaries || []).find((a) => a.name === n) || {};\nconst images = files.filter((f) => f.kind === 'image' && !f.generated).map((f) => '- ' + f.name + ': ' + (sum(f.name).description || 'user image') + ' (suggested use: ' + (sum(f.name).bestUse || 'reference') + ')').join('\\n');\nconst docs = files.filter((f) => f.text).map((f) => '### ' + f.name + '\\n' + f.text.slice(0, 20000)).join('\\n\\n').slice(0, 60000);\nconst answers = (j.answers || []).map((a) => JSON.stringify(a)).join('\\n');\nconst revising = j.storyboard && (j.revisionNotes || []).length;\nconst maxTotal = Math.min(spec.durationSec + 4, cfg.maxScenes * 8);\n\nconst prompt = `You are the CREATIVE DIRECTOR + STORYBOARD PLANNER of an automated AI video studio. Clips are generated with Google Veo 3.1 (text/image-to-video with NATIVE AUDIO: speech, sound effects, ambience, music). Each clip is exactly ${hiRes ? '8' : '4, 6 or 8'} seconds. Clips are stitched together afterwards.\n\nBRIEF\nTitle: ${spec.title}\nTopic: ${j.topic}\nInstructions: ${j.instructions || '(none)'}\nSpec: ${JSON.stringify(spec)}\nUser clarification answers: ${answers || '(none)'}\nAssumptions made: ${(j.assumptions || []).join(' | ') || '(none)'}\n\nRESEARCH NOTES (verify claims against these, do not invent facts)\n${(j.research && j.research.text) || '(none)'}\n\nUSER IMAGES AVAILABLE (use these exact file names in imageUse.files)\n${images || '(none)'}\n\nUSER DOCUMENT CONTENT\n${docs || '(none)'}\n\nHARD CONSTRAINTS\n- Aspect ratio ${spec.aspectRatio}. Target total duration ${spec.durationSec}s (sum of scene durations must be between ${Math.max(4, spec.durationSec - 4)} and ${maxTotal}). Max ${cfg.maxScenes} scenes.\n- ${hiRes ? 'Every scene durationSec MUST be 8.' : 'Every scene durationSec must be 4, 6 or 8.'}\n- Scenes using imageUse.mode \"reference\" (max 3 images) are always generated at 8s. mode \"first_frame\" uses exactly 1 image as the opening frame. Otherwise mode \"none\".\n- If the user supplied no suitable images but visual consistency of a character/product across scenes matters, add up to 3 referenceImagePrompts (ids R1..R3) and use those ids in imageUse.files. Otherwise leave referenceImagePrompts empty.\n- Veo prompt craft: each visualPrompt is self-contained and includes: subject (repeat the FULL character/product description every scene for consistency), action, setting, visual style, camera position/motion, composition, lens/focus, lighting/ambience.\n- Audio is generated by Veo: write spoken lines in quotes with who speaks and a voice description (reuse identical voice descriptions across scenes), add sound effects and ambience, and music direction. Keep dialogue to about 2.5 words per second of scene length. Language of speech: ${spec.language || 'English'}.\n- Do NOT request on-screen text, subtitles, captions, watermarks or logos inside the Veo prompt (captions are added in post). Put wanted on-screen text in onScreenText instead.\n- ${spec.aspectRatio === '9:16' ? 'Vertical short-form: strong hook in the first 3 seconds, fast pacing, one idea per scene, clear CTA at the end.' : 'Landscape: clear narrative arc (hook, development, payoff), establishing and detail shots mixed.'}\n- safeVisualPrompt = a softened rewrite of visualPrompt (no real people/celebrities, brands, violence, minors, medical or political claims) that conveys the same idea; used automatically if Veo's safety filter blocks the original.\n- Must include: ${(spec.mustInclude || []).join('; ') || '-'}. Must avoid: ${(spec.avoid || []).join('; ') || '-'}.\n${revising ? `\nREVISION MODE\nExisting storyboard (JSON): ${JSON.stringify(j.storyboard)}\nFeedback to apply: ${(j.revisionNotes || []).join('\\n')}\nChange ONLY the scenes affected by the feedback (and the style bible if required). Every unaffected scene must be returned with its visualPrompt, safeVisualPrompt, durationSec and imageUse EXACTLY identical to the existing storyboard so already-rendered clips are reused. You may add, remove or reorder scenes only if the feedback requires it.` : ''}\n\nReturn ONLY JSON with exactly this shape:\n{\"title\":\"\",\"logline\":\"\",\n \"styleBible\":{\"visualStyle\":\"\",\"palette\":\"\",\"cameraLanguage\":\"\",\"lighting\":\"\",\"characters\":[{\"id\":\"C1\",\"description\":\"\"}],\"locations\":[\"\"],\"audioStyle\":\"\",\"voice\":\"\"},\n \"referenceImagePrompts\":[{\"id\":\"R1\",\"purpose\":\"character|product|style\",\"prompt\":\"\"}],\n \"scenes\":[{\"index\":1,\"durationSec\":8,\"purpose\":\"hook\",\"visualPrompt\":\"\",\"safeVisualPrompt\":\"\",\"dialogue\":\"\",\"onScreenText\":\"\",\"transition\":\"cut\",\"imageUse\":{\"mode\":\"none\",\"files\":[]}}],\n \"caption\":\"social caption with hashtags\",\"thumbnailIdea\":\"\",\"musicDirection\":\"\"}`;\nconst model = j.useFallback ? cfg.textModelFallback : cfg.textModel;\nconst reqBody = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.8, maxOutputTokens: 24000 } };\nreturn [{ json: { ...j, model, reqBody } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "76950fa7-0b67-4741-9413-89d9b43ac0a9",
+      "name": "Build Planner Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + $json.model + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reqBody) }}",
+        "options": {
+          "timeout": 420000
+        }
+      },
+      "id": "52fc00f7-39da-4832-914b-b10aa8c7a36e",
+      "name": "Storyboard Planner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst req = $('Build Planner Request').first().json;\nconst r = $input.first().json || {};\nconst job = { ...req };\ndelete job.reqBody; delete job.model;\nconst cfg = job.cfg, spec = job.spec;\nconst hiRes = cfg.resolution !== '720p';\n\nfunction parseJson(t) {\n  t = String(t || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n  try { return JSON.parse(t); } catch (e) {\n    const a = t.indexOf('{'), b = t.lastIndexOf('}');\n    if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));\n    throw e;\n  }\n}\nconst fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16).padStart(8, '0'); };\n\nlet sb = null, failure = '';\ntry {\n  if (r.error || !r.candidates) throw new Error(typeof r.error === 'string' ? r.error : JSON.stringify(r.error || r).slice(0, 300));\n  const text = (r.candidates[0].content.parts || []).map((p) => p.text || '').join('');\n  sb = parseJson(text);\n  if (!sb || !Array.isArray(sb.scenes) || !sb.scenes.length) throw new Error('storyboard has no scenes');\n} catch (e) { failure = e.message; sb = null; }\n\nif (!sb) {\n  if (!job.useFallback) return [{ json: { ...job, retryPlanner: true, useFallback: true } }];\n  throw new Error('Storyboard planning failed on primary and fallback model: ' + failure);\n}\n\nconst files = (job.assets && job.assets.files) || [];\nlet scenes = sb.scenes.filter((s) => s && s.visualPrompt).slice(0, cfg.maxScenes);\nlet total = 0;\nscenes = scenes.map((s, i) => {\n  let d = Math.round(Number(s.durationSec) || 8);\n  d = [4, 6, 8].reduce((p, c) => (Math.abs(c - d) < Math.abs(p - d) ? c : p));\n  if (hiRes) d = 8;\n  const iu = s.imageUse || {};\n  let mode = ['reference', 'first_frame'].includes(iu.mode) ? iu.mode : 'none';\n  let fl = (Array.isArray(iu.files) ? iu.files.map(String) : []).filter((n) => files.some((f) => f.name === n) || /^R[1-3]$/.test(n));\n  if (mode === 'first_frame') fl = fl.slice(0, 1);\n  if (mode === 'reference') { fl = fl.slice(0, 3); d = 8; }\n  if (!fl.length) mode = 'none';\n  const scene = {\n    index: i + 1, durationSec: d, purpose: String(s.purpose || ''),\n    visualPrompt: String(s.visualPrompt).trim(), safeVisualPrompt: String(s.safeVisualPrompt || '').trim(),\n    dialogue: String(s.dialogue || '').trim(), onScreenText: String(s.onScreenText || '').trim(),\n    transition: s.transition === 'fade' ? 'fade' : 'cut', imageUse: { mode, files: fl }\n  };\n  scene.hash = fnv(JSON.stringify([scene.visualPrompt, scene.safeVisualPrompt, d, mode, fl, spec.aspectRatio, cfg.resolution]));\n  return scene;\n});\n// enforce max total duration\nconst kept = [];\nfor (const s of scenes) { if (total + s.durationSec > cfg.maxDurationSec) break; total += s.durationSec; kept.push(s); }\nif (!kept.length) throw new Error('Planner returned no usable scenes.');\n\nconst refPrompts = (Array.isArray(sb.referenceImagePrompts) ? sb.referenceImagePrompts : [])\n  .filter((p) => p && p.prompt && /^R[1-3]$/.test(String(p.id))).slice(0, 3)\n  .map((p) => ({ id: String(p.id), purpose: String(p.purpose || ''), prompt: String(p.prompt) }));\n\njob.storyboard = {\n  title: String(sb.title || spec.title), logline: String(sb.logline || ''), styleBible: sb.styleBible || {},\n  referenceImagePrompts: refPrompts, scenes: kept, caption: String(sb.caption || ''),\n  thumbnailIdea: String(sb.thumbnailIdea || ''), musicDirection: String(sb.musicDirection || ''), totalDurationSec: total\n};\njob.needRefs = refPrompts.some((p) => !files.some((f) => f.name.startsWith('ref_' + p.id + '.')));\njob.retryPlanner = false;\njob.useFallback = false;\nfs.writeFileSync(job.jobDir + '/job.json', JSON.stringify(job, null, 2));\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "3872178d-9f02-472f-bfd2-679de80f1534",
+      "name": "Parse Storyboard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3380,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.retryPlanner }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "6965af3e-79d8-4be2-bea2-040febd46a10"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d1567587-f8ca-4af8-8a37-82b2ad0a4165",
+      "name": "Planner Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3640,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needRefs }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "f53d61ed-26d7-4c0b-9de5-06b92ed1c8cb"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c67ce193-fd92-4fe0-b848-78e2300e88b9",
+      "name": "Need Reference Images?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3900,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst files = (j.assets && j.assets.files) || [];\nconst todo = j.storyboard.referenceImagePrompts.filter((p) => !files.some((f) => f.name.startsWith('ref_' + p.id + '.')));\nreturn todo.map((p) => ({\n  json: {\n    refId: p.id, purpose: p.purpose, model: j.cfg.imageModel,\n    reqBody: { contents: [{ role: 'user', parts: [{ text: p.prompt + ' Neutral plain background, subject fully visible, high detail, photorealistic unless the style says otherwise, no text, no watermark.' }] }], generationConfig: { responseModalities: ['IMAGE'] } }\n  }\n}));\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "84ebc872-e6bf-400c-a84b-921fb5a1d50a",
+      "name": "Prepare Ref Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4160,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + $json.model + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reqBody) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "17971521-a2b2-43ef-a441-2e26ef2af78a",
+      "name": "Reference Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4420,
+        180
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst job = { ...$('Parse Storyboard').first().json };\nconst jobs = $('Prepare Ref Jobs').all();\nconst items = $input.all();\nconst files = [...((job.assets && job.assets.files) || [])];\nconst warnings = [...((job.assets && job.assets.warnings) || [])];\nitems.forEach((it, i) => {\n  const refId = jobs[i] && jobs[i].json.refId;\n  try {\n    const parts = it.json.candidates[0].content.parts || [];\n    const p = parts.find((x) => x.inlineData || x.inline_data);\n    const d = p.inlineData || p.inline_data;\n    const mime = d.mimeType || d.mime_type || 'image/png';\n    const ext = /jpe?g/.test(mime) ? 'jpg' : /webp/.test(mime) ? 'webp' : 'png';\n    const name = 'ref_' + refId + '.' + ext;\n    const path = job.jobDir + '/in/' + name;\n    fs.writeFileSync(path, Buffer.from(d.data, 'base64'));\n    files.push({ name, path, ext, kind: 'image', generated: true, bytes: fs.statSync(path).size });\n  } catch (e) { warnings.push('Reference image ' + refId + ' could not be generated (' + (it.json.error ? 'API error' : e.message) + '); scenes fall back to text-only.'); }\n});\njob.assets = { ...job.assets, files, warnings };\njob.needRefs = false;\nfs.writeFileSync(job.jobDir + '/job.json', JSON.stringify(job, null, 2));\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "dc173d68-eb65-434d-8367-d41b127ca3cf",
+      "name": "Collect Refs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4680,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst job = $input.first().json;\nconst sb = job.storyboard, cfg = job.cfg, spec = job.spec;\nconst files = (job.assets && job.assets.files) || [];\nconst pathFor = (n) => {\n  const f = files.find((x) => x.name === n) || files.find((x) => x.name.startsWith('ref_' + n + '.'));\n  return f && fs.existsSync(f.path) ? f.path : null;\n};\nconst small = {\n  scenePaceSec: cfg.scenePaceSec, pollIntervalSec: cfg.pollIntervalSec, maxPollMinutes: cfg.maxPollMinutes,\n  backoffBaseSec: cfg.backoffBaseSec, backoffMaxSec: cfg.backoffMaxSec, maxSubmitRetriesPerTier: cfg.maxSubmitRetriesPerTier,\n  maxPromptSoftenings: cfg.maxPromptSoftenings, imageModel: cfg.imageModel, fps: cfg.fps\n};\nconst clips = job.clips || {};\nconst out = sb.scenes.map((s) => {\n  const c = clips[s.index];\n  const cached = !!(c && c.hash === s.hash && c.path && fs.existsSync(c.path));\n  const imagePaths = (s.imageUse.files || []).map(pathFor).filter(Boolean);\n  const mode = imagePaths.length ? s.imageUse.mode : 'none';\n  return {\n    json: {\n      jobId: job.jobId, jobDir: job.jobDir, sceneIndex: s.index,\n      scene: { index: s.index, durationSec: s.durationSec, visualPrompt: s.visualPrompt, safeVisualPrompt: s.safeVisualPrompt, hash: s.hash, onScreenText: s.onScreenText },\n      aspectRatio: spec.aspectRatio, resolution: cfg.resolution, imageMode: mode, imagePaths,\n      outPath: job.jobDir + '/clips/scene_' + s.index + '_' + s.hash + '.mp4',\n      needsRender: !cached, cachedPath: cached ? c.path : null, cachedMeta: cached ? c : null,\n      tiers: job.tiers, cfg: small\n    }\n  };\n});\nreturn out;\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "be533c49-5f5c-402a-93e0-25bfcb448e4e",
+      "name": "Expand Scenes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4940,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_SUB_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "47a249ec-1651-4fdf-a272-421f4fdefc31",
+      "name": "Render Scene",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        5200,
+        360
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst sceneItems = $('Expand Scenes').all();\nconst results = $input.all();\nconst first = sceneItems[0].json;\nconst job = JSON.parse(fs.readFileSync(first.jobDir + '/job.json', 'utf8'));\nconst cfg = job.cfg;\nconst prevClips = job.clips || {};\nconst clips = {};\nconst failed = [], lines = [];\nconst stats = { veo: 0, still: 0, cached: 0 };\nsceneItems.forEach((s, i) => {\n  const r = (results[i] && results[i].json) || {};\n  const idx = s.json.sceneIndex;\n  const ok = (r.status === 'ok' || r.status === 'cached') && r.clipPath && fs.existsSync(r.clipPath);\n  if (ok) {\n    clips[idx] = { path: r.clipPath, hash: s.json.scene.hash, source: r.source || 'veo', model: r.model || '', attempts: r.attempts || 0, errors: r.errors || [] };\n    if (r.status === 'cached') stats.cached++; else if (r.source === 'still') stats.still++; else stats.veo++;\n    if (r.source === 'still') lines.push('Scene ' + idx + ': Veo unavailable after all retries/fallbacks - used an animated still image instead.');\n  } else {\n    failed.push(idx);\n    lines.push('Scene ' + idx + ' FAILED: ' + ((r.errors || [r.error && (r.error.message || r.error)]).filter(Boolean).slice(-3).join(' | ') || 'unknown error'));\n  }\n});\njob.clips = clips;\njob.failedScenes = failed;\njob.renderStats = stats;\njob.renderNotes = lines;\njob.abort = failed.length > cfg.maxFailedScenes;\njob.abortMessage = 'Your video \"' + (job.storyboard.title || job.spec.title) + '\" (job ' + job.jobId + ') could not be completed: ' + failed.length + ' scene(s) failed to render.\\n\\n' + lines.join('\\n') + '\\n\\nNothing was saved to Drive. Intermediate files are kept on the server for debugging.';\nfs.writeFileSync(job.jobDir + '/job.json', JSON.stringify(job, null, 2));\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "d643e484-ec3d-4125-8c80-e99eaf56d82f",
+      "name": "Collect Clips",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5460,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.abort }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "042fb312-474f-4314-96f3-d710b1c23ddd"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7352a141-f66c-419f-97d2-c75b41d56602",
+      "name": "Render Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5720,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.requesterEmail + ($json.adminEmail && $json.adminEmail !== $json.requesterEmail ? ',' + $json.adminEmail : '') }}",
+        "subject": "={{ 'Video job failed: ' + $json.spec.title }}",
+        "emailType": "text",
+        "message": "={{ $json.abortMessage }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "9d3a4b69-1548-4c36-93d3-54d4f86a9a1a",
+      "name": "Notify Render Failure",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5720,
+        720
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "0d063705-3b35-433e-9fca-0c81ed167566"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst job = $input.first().json;\nconst sb = job.storyboard, spec = job.spec, cfg = job.cfg;\nconst base = { '720p': [1280, 720], '1080p': [1920, 1080], '4k': [3840, 2160] }[cfg.resolution] || [1280, 720];\nconst vertical = spec.aspectRatio === '9:16';\nconst W = vertical ? base[1] : base[0], H = vertical ? base[0] : base[1];\nconst dir = job.jobDir, work = dir + '/work', out = dir + '/out';\nconst scenes = sb.scenes.filter((s) => job.clips[s.index] && fs.existsSync(job.clips[s.index].path));\nif (!scenes.length) throw new Error('No rendered clips available to assemble.');\n\nconst fmt = (sec) => {\n  const ms = Math.round(sec * 1000), h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000), s = Math.floor((ms % 60000) / 1000), r = ms % 1000;\n  const p = (n, l = 2) => String(n).padStart(l, '0');\n  return p(h) + ':' + p(m) + ':' + p(s) + ',' + p(r, 3);\n};\nconst sh = [];\nsh.push('#!/bin/sh', 'set -e', 'cd \"' + work + '\"');\nsh.push('W=' + W, 'H=' + H, 'FPS=' + cfg.fps);\nsh.push(`norm() { # in out duration\n  if [ -n \"$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 \"$1\")\" ]; then\n    ffmpeg -hide_banner -loglevel error -y -i \"$1\" -t \"$3\" -vf \"scale=$W:$H:force_original_aspect_ratio=increase,crop=$W:$H,fps=$FPS,format=yuv420p,setsar=1\" -af \"aresample=48000,aformat=channel_layouts=stereo,apad,afade=t=in:d=0.04\" -c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k -ar 48000 -ac 2 \"$2\"\n  else\n    ffmpeg -hide_banner -loglevel error -y -i \"$1\" -f lavfi -i anullsrc=r=48000:cl=stereo -t \"$3\" -vf \"scale=$W:$H:force_original_aspect_ratio=increase,crop=$W:$H,fps=$FPS,format=yuv420p,setsar=1\" -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k -ar 48000 -ac 2 \"$2\"\n  fi\n}`);\nlet t = 0;\nconst list = [], srt = [];\nscenes.forEach((s, i) => {\n  const n = String(i + 1).padStart(2, '0');\n  sh.push('norm \"' + job.clips[s.index].path + '\" \"' + work + '/n' + n + '.mp4\" ' + s.durationSec);\n  list.push(\"file '\" + work + '/n' + n + \".mp4'\");\n  const txt = (s.onScreenText || s.dialogue || '').replace(/[{}]/g, '').replace(/\\s+/g, ' ').trim();\n  if (txt) srt.push((srt.length + 1) + '\\n' + fmt(t + 0.15) + ' --> ' + fmt(t + s.durationSec - 0.15) + '\\n' + txt + '\\n');\n  t += s.durationSec;\n});\nfs.writeFileSync(work + '/list.txt', list.join('\\n') + '\\n');\nconst captions = spec.captions !== false && cfg.burnCaptions && srt.length > 0;\nif (captions) fs.writeFileSync(work + '/captions.srt', srt.join('\\n'));\nconst style = \"FontName=DejaVu Sans,FontSize=\" + (vertical ? 16 : 14) + \",PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=\" + (vertical ? 70 : 18);\nconst vf = captions ? ' -vf \"subtitles=\\'' + work + \"/captions.srt':force_style='\" + style + '\\'\"' : '';\nconst vcodec = captions ? '-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p' : '-c:v copy';\nsh.push('ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i \"' + work + '/list.txt\"' + vf + ' -af \"loudnorm=I=-16:TP=-1.5:LRA=11\" ' + vcodec + ' -c:a aac -b:a 192k -movflags +faststart \"' + out + '/final.mp4\"');\nconst thumbAt = Math.min(2, Math.max(0.5, t / 4)).toFixed(2);\nsh.push('ffmpeg -hide_banner -loglevel error -y -ss ' + thumbAt + ' -i \"' + out + '/final.mp4\" -frames:v 1 -q:v 2 \"' + out + '/thumbnail.jpg\"');\nconst scale = vertical ? 'scale=480:-2' : 'scale=-2:480';\nconst scale2 = vertical ? 'scale=320:-2' : 'scale=-2:320';\nsh.push('ffmpeg -hide_banner -loglevel error -y -i \"' + out + '/final.mp4\" -vf \"' + scale + '\" -r 24 -c:v libx264 -preset veryfast -crf 31 -c:a aac -b:a 64k -ac 1 -movflags +faststart \"' + out + '/proxy.mp4\"');\nsh.push('if [ \"$(stat -c %s \"' + out + '/proxy.mp4\")\" -gt 12000000 ]; then ffmpeg -hide_banner -loglevel error -y -i \"' + out + '/final.mp4\" -vf \"' + scale2 + '\" -r 15 -c:v libx264 -preset veryfast -crf 36 -c:a aac -b:a 32k -ac 1 -movflags +faststart \"' + out + '/proxy.mp4\"; fi');\nsh.push('echo \"DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \"' + out + '/final.mp4\")\"');\nsh.push('echo \"SIZE_FINAL=$(stat -c %s \"' + out + '/final.mp4\")\"');\nsh.push('echo \"SIZE_PROXY=$(stat -c %s \"' + out + '/proxy.mp4\")\"');\nfs.writeFileSync(work + '/assemble.sh', sh.join('\\n') + '\\n');\nreturn [{ json: { ...job, assembledScenes: scenes.map((s) => s.index), plannedDurationSec: t, assembleCmd: 'sh \"' + work + '/assemble.sh\"' } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "568fa65c-9c32-4f71-96b7-31a6893cbf64",
+      "name": "Build Assemble Script",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5980,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.assembleCmd }}"
+      },
+      "id": "8e643832-cd3c-4232-8ec8-ec518e42ee2d",
+      "name": "Assemble Video (ffmpeg)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        6240,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst job = { ...$('Build Assemble Script').first().json };\nconst r = $input.first().json || {};\nconst out = job.jobDir + '/out';\nconst out_files = { final: out + '/final.mp4', thumbnail: out + '/thumbnail.jpg', proxy: out + '/proxy.mp4' };\nfor (const k of Object.keys(out_files)) {\n  if (!fs.existsSync(out_files[k]) || fs.statSync(out_files[k]).size < 1000) {\n    throw new Error('Assembly failed: missing ' + k + '. ffmpeg said: ' + String(r.stderr || r.stdout || '').slice(-800));\n  }\n}\nconst m = String(r.stdout || '').match(/DURATION=([\\d.]+)/);\njob.out = out_files;\njob.finalDurationSec = m ? Math.round(parseFloat(m[1]) * 10) / 10 : job.plannedDurationSec;\njob.finalBytes = fs.statSync(out_files.final).size;\ndelete job.assembleCmd;\nfs.writeFileSync(job.jobDir + '/job.json', JSON.stringify(job, null, 2));\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "71e9787d-419f-4fca-a494-17fdd3dac118",
+      "name": "Check Assembly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6500,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst j = $input.first().json;\nconst sb = j.storyboard, spec = j.spec;\nlet t = 0;\nconst timeline = sb.scenes.filter((s) => (j.assembledScenes || []).includes(s.index)).map((s) => {\n  const row = 'Scene ' + s.index + ' [' + t + 's-' + (t + s.durationSec) + 's] purpose=' + s.purpose + ' | dialogue=' + JSON.stringify(s.dialogue) + ' | onScreenText=' + JSON.stringify(s.onScreenText) + ' | intended=' + s.visualPrompt.slice(0, 260);\n  t += s.durationSec;\n  return row;\n}).join('\\n');\nconst prompt = `You are a strict, experienced video QA editor. Watch the attached video (low-resolution preview) and judge it against the brief.\n\nBRIEF: ${j.topic} | ${j.instructions || ''}\nSPEC: ${JSON.stringify(spec)}\nSCENE TIMELINE:\n${timeline}\n\nCheck: (1) matches the brief and key message, (2) hook strength in the first 3 seconds, (3) visual continuity of characters/products/style between scenes, (4) AI artifacts (warped hands/faces, flicker, melting objects, gibberish text), (5) audio: speech clarity, sound/music fit, abrupt cuts or volume jumps, (6) pacing and duration, (7) factual claims vs research: ${((j.research && j.research.text) || 'n/a').slice(0, 1500)}\nMap each issue to the scene index it belongs to (use the timeline) or null if global. severity \"major\" only for problems a viewer would clearly notice or that contradict the brief.\n\nReturn ONLY JSON:\n{\"score\":0-10,\"summary\":\"2-3 sentences\",\"strengths\":[\"\"],\"issues\":[{\"sceneIndex\":1,\"severity\":\"major|minor\",\"problem\":\"\",\"fix\":\"how to change the scene prompt\"}]}`;\nconst buf = fs.readFileSync(j.out.proxy);\nlet parts;\nif (buf.length > 14 * 1024 * 1024) {\n  parts = [{ text: 'Reply with exactly this JSON: {\"score\":null,\"summary\":\"Preview too large for automated QA.\",\"strengths\":[],\"issues\":[]}' }];\n} else {\n  parts = [{ inline_data: { mime_type: 'video/mp4', data: buf.toString('base64') } }, { text: prompt }];\n}\nconst reqBody = { contents: [{ role: 'user', parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0.2 } };\nreturn [{ json: { ...j, model: j.cfg.textModel, reqBody } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "602add1d-60cc-44ee-99b6-b963885dc262",
+      "name": "Build QA Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6760,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + $json.model + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reqBody) }}",
+        "options": {
+          "timeout": 420000
+        }
+      },
+      "id": "2440e871-621a-41dd-aadc-e5a1dc72a289",
+      "name": "QA Agent (watches the video)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7020,
+        360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst req = $('Build QA Request').first().json;\nconst r = $input.first().json || {};\nconst job = { ...req };\ndelete job.reqBody; delete job.model;\nfunction parseJson(t) {\n  t = String(t || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n  try { return JSON.parse(t); } catch (e) { const a = t.indexOf('{'), b = t.lastIndexOf('}'); if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1)); throw e; }\n}\nlet qa = null;\ntry {\n  if (r.error || !r.candidates) throw new Error('QA call failed');\n  qa = parseJson((r.candidates[0].content.parts || []).map((p) => p.text || '').join(''));\n} catch (e) { qa = null; }\nconst cfg = job.cfg;\nif (!qa || qa.score === null || qa.score === undefined) {\n  qa = { score: null, summary: (qa && qa.summary) || 'Automated QA was unavailable; please review the preview carefully.', strengths: [], issues: [], unavailable: true };\n}\nqa.issues = Array.isArray(qa.issues) ? qa.issues : [];\nconst major = qa.issues.filter((i) => String(i.severity).toLowerCase() === 'major');\nqa.passes = qa.unavailable ? true : (Number(qa.score) >= cfg.qaPassScore && major.length === 0);\nconst fixable = major.filter((i) => Number.isInteger(i.sceneIndex) && job.storyboard.scenes.some((s) => s.index === i.sceneIndex));\njob.qa = qa;\njob.needAutoFix = !qa.passes && !qa.unavailable && (job.autoFixRound || 0) < cfg.autoFixRoundsMax && fixable.length > 0;\nfs.writeFileSync(job.jobDir + '/job.json', JSON.stringify(job, null, 2));\nreturn [{ json: job }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "8dd762ce-d815-4c59-88c5-32b6457238b3",
+      "name": "Evaluate QA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7280,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needAutoFix }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "baad36b9-5fb7-4463-9e1e-8b77fbb3551d"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "abab4875-840d-4bac-8a79-e77211c09839",
+      "name": "Auto-Fix Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7540,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst notes = (j.qa.issues || []).filter((i) => i.sceneIndex || String(i.severity).toLowerCase() === 'major')\n  .map((i) => 'Scene ' + (i.sceneIndex || 'global') + ' (' + i.severity + '): ' + i.problem + ' -> ' + i.fix);\nreturn [{ json: { ...j, revisionNotes: ['AUTOMATIC QA FEEDBACK (score ' + j.qa.score + '/10):\\n' + notes.join('\\n')], autoFixRound: (j.autoFixRound || 0) + 1, needAutoFix: false, useFallback: false } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "11b80ede-8b3a-4cc6-8370-4f83cf1ad596",
+      "name": "Prepare Auto-Fix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7540,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst j = $input.first().json;\nconst esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst qa = j.qa || {};\nconst scenes = j.storyboard.scenes.map((s) => '<li><b>Scene ' + s.index + '</b> (' + s.durationSec + 's, ' + esc(s.purpose) + ')' + (s.dialogue ? ' - \"' + esc(s.dialogue) + '\"' : '') + (j.clips[s.index] && j.clips[s.index].source === 'still' ? ' <i>[animated still fallback]</i>' : '') + '</li>').join('');\nconst issues = (qa.issues || []).map((i) => '<li>[' + esc(i.severity) + '] Scene ' + esc(i.sceneIndex || 'global') + ': ' + esc(i.problem) + '</li>').join('');\nconst html = '<h2>' + esc(j.storyboard.title) + '</h2><p>' + esc(j.storyboard.logline) + '</p>'\n  + '<p><b>Format:</b> ' + esc(j.spec.aspectRatio) + ', ' + j.finalDurationSec + 's &nbsp; <b>Job:</b> ' + j.jobId + '</p>'\n  + '<p><b>Automated QA:</b> ' + (qa.score === null || qa.score === undefined ? 'n/a' : qa.score + '/10') + ' - ' + esc(qa.summary) + '</p>'\n  + (issues ? '<p>QA issues:</p><ul>' + issues + '</ul>' : '')\n  + ((j.assumptions || []).length ? '<p><b>Assumptions I made:</b></p><ul>' + j.assumptions.map((a) => '<li>' + esc(a) + '</li>').join('') + '</ul>' : '')\n  + ((j.renderNotes || []).length ? '<p><b>Render notes:</b></p><ul>' + j.renderNotes.map((a) => '<li>' + esc(a) + '</li>').join('') + '</ul>' : '')\n  + '<p><b>Storyboard</b></p><ul>' + scenes + '</ul>'\n  + '<p>The attached file is a small preview. A second email follows with the Approve / Needs-changes buttons. The full-quality video is saved to Google Drive only after you approve.</p>';\nconst text = j.storyboard.title + ' - ' + j.spec.aspectRatio + ', ' + j.finalDurationSec + 's\\n'\n  + 'Automated QA: ' + (qa.score === null || qa.score === undefined ? 'n/a' : qa.score + '/10') + ' - ' + (qa.summary || '') + '\\n\\n'\n  + 'Please watch the preview video attached to the previous email, then choose below.\\n'\n  + 'Approve = save the full-quality video + thumbnail + script to Google Drive.\\n'\n  + 'Needs changes = tell me what to change and I will regenerate only the affected scenes.';\nconst buf = fs.readFileSync(j.out.proxy);\nconst bin = await this.helpers.prepareBinaryData(buf, 'preview.mp4', 'video/mp4');\nreturn [{ json: { ...j, previewHtml: html, approvalText: text, previewSubject: 'Preview: ' + j.storyboard.title }, binary: { data: bin } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ab13f05d-46ff-45c4-b2d7-e088a0877e33",
+      "name": "Load Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7800,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.requesterEmail }}",
+        "subject": "={{ $json.previewSubject }}",
+        "emailType": "html",
+        "message": "={{ $json.previewHtml }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "data"
+              }
+            ]
+          }
+        }
+      },
+      "id": "c238a3e7-7e68-4359-8f34-b1931bee4dfd",
+      "name": "Send Preview",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        8060,
+        360
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "e1459407-7e73-4df6-8eb1-de42636a717f"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendAndWait",
+        "sendTo": "={{ $('Load Preview').first().json.requesterEmail }}",
+        "subject": "={{ 'Approve this video? ' + $('Load Preview').first().json.storyboard.title }}",
+        "message": "={{ $('Load Preview').first().json.approvalText }}",
+        "responseType": "approval",
+        "options": {
+          "appendAttribution": false,
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 48,
+              "resumeUnit": "hours"
+            }
+          }
+        },
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Approve - save to Drive",
+            "buttonApprovalStyle": "primary",
+            "disapproveLabel": "Needs changes",
+            "buttonDisapprovalStyle": "secondary"
+          }
+        }
+      },
+      "id": "80f01326-74c5-49dd-bf0b-ac39cf3f7010",
+      "name": "Request Approval",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        8320,
+        360
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "6b59c537-2150-43bf-a63c-00c4bf188cc6"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !!($json.data && $json.data.approved === true) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "c8f4b153-eaf6-49be-b330-74c9dbec3532"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f261ceaf-8d95-427d-9154-f41a6bee7119",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        8580,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = { ...$('Load Preview').first().json };\ndelete j.previewHtml; delete j.approvalText; delete j.previewSubject;\nconst title = String((j.storyboard && j.storyboard.title) || j.spec.title || 'video');\nj.slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50) || 'video';\nj.folderName = new Date().toISOString().slice(0, 10) + ' - ' + title.slice(0, 80) + ' (' + j.jobId + ')';\nreturn [{ json: j }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "88726e83-0651-489c-b9f3-f9c328d7fabd",
+      "name": "Restore Job (Approved)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8840,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $json.folderName }}",
+        "driveId": {
+          "__rl": true,
+          "value": "My Drive",
+          "mode": "list",
+          "cachedResultName": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $json.cfg.driveParentFolderId }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "cb02ad13-26ec-4447-a749-407cb1954de0",
+      "name": "Create Drive Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        9100,
+        180
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "gdrive-oauth2",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst helpers = this.helpers;\nconst j = $('Restore Job (Approved)').first().json;\nconst folderId = $input.first().json.id;\nif (!folderId) throw new Error('Drive folder was not created.');\nconst sb = j.storyboard;\nconst mk = async (buf, name, mime) => ({ json: { fileName: name, folderId, jobId: j.jobId }, binary: { data: await helpers.prepareBinaryData(buf, name, mime) } });\n\nconst md = ['# ' + sb.title, '', sb.logline, '', '**Format:** ' + j.spec.aspectRatio + ' - ' + j.finalDurationSec + 's - language: ' + (j.spec.language || 'n/a'), '',\n  '## Social caption', sb.caption || '-', '', '## Music direction', sb.musicDirection || '-', '', '## Scenes', ''];\nsb.scenes.forEach((s) => {\n  md.push('### Scene ' + s.index + ' (' + s.durationSec + 's) - ' + (s.purpose || ''));\n  if (s.dialogue) md.push('**Dialogue:** ' + s.dialogue);\n  if (s.onScreenText) md.push('**On-screen text:** ' + s.onScreenText);\n  md.push('**Veo prompt:** ' + s.visualPrompt, '');\n});\nif (j.research && j.research.sources && j.research.sources.length) {\n  md.push('## Research sources', ...j.research.sources.map((x) => '- ' + (x.title || x.url) + ' - ' + x.url));\n}\nconst manifest = {\n  jobId: j.jobId, createdAt: j.createdAt, requester: j.requesterEmail, spec: j.spec, assumptions: j.assumptions,\n  qa: j.qa, renderStats: j.renderStats, renderNotes: j.renderNotes, finalDurationSec: j.finalDurationSec,\n  scenes: sb.scenes.map((s) => ({ index: s.index, durationSec: s.durationSec, hash: s.hash, clip: j.clips[s.index] ? { source: j.clips[s.index].source, model: j.clips[s.index].model, attempts: j.clips[s.index].attempts, errors: j.clips[s.index].errors } : null })),\n  revisionRounds: j.revisionRound, autoFixRounds: j.autoFixRound\n};\nreturn [\n  await mk(fs.readFileSync(j.out.final), j.slug + '.mp4', 'video/mp4'),\n  await mk(fs.readFileSync(j.out.thumbnail), j.slug + '-thumbnail.jpg', 'image/jpeg'),\n  await mk(Buffer.from(md.join('\\n'), 'utf8'), j.slug + '-script.md', 'text/markdown'),\n  await mk(Buffer.from(JSON.stringify(sb, null, 2), 'utf8'), j.slug + '-storyboard.json', 'application/json'),\n  await mk(Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'), j.slug + '-manifest.json', 'application/json')\n];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "1f1047ee-c4f5-4bb7-a0f2-eeb5e1052b2f",
+      "name": "Load Deliverables",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9360,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "inputDataFieldName": "data",
+        "name": "={{ $json.fileName }}",
+        "driveId": {
+          "__rl": true,
+          "value": "My Drive",
+          "mode": "list",
+          "cachedResultName": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $json.folderId }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "6c431e24-2f08-4433-95aa-ede4761c97ec",
+      "name": "Upload to Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        9620,
+        180
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "gdrive-oauth2",
+          "name": "Google Drive account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = { ...$('Restore Job (Approved)').first().json };\nconst folderId = $('Create Drive Folder').first().json.id;\nconst ups = $input.all().map((i) => i.json);\nconst video = ups.find((u) => /\\.mp4$/i.test(u.name || '')) || ups[0] || {};\nj.driveFolderUrl = 'https://drive.google.com/drive/folders/' + folderId;\nj.videoUrl = video.id ? 'https://drive.google.com/file/d/' + video.id + '/view' : j.driveFolderUrl;\nj.deliveryMessage = 'Approved and saved.\\n\\n\"' + j.storyboard.title + '\" (' + j.spec.aspectRatio + ', ' + j.finalDurationSec + 's)\\nVideo: ' + j.videoUrl + '\\nFolder (video, thumbnail, script, storyboard, manifest): ' + j.driveFolderUrl + '\\n\\nSuggested caption:\\n' + (j.storyboard.caption || '-');\nconst dir = j.jobDir;\nj.cleanupCmd = (j.cfg.cleanupAfter && /\\/video-jobs\\/job_[a-z0-9]+$/.test(dir)) ? 'rm -rf \"' + dir + '\"' : 'echo \"cleanup skipped\"';\nreturn [{ json: j }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "12fd567b-49c0-4122-9841-995252b1906a",
+      "name": "Delivery Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9880,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.requesterEmail }}",
+        "subject": "={{ 'Saved to Drive: ' + $json.storyboard.title }}",
+        "emailType": "text",
+        "message": "={{ $json.deliveryMessage }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "0c85619c-6bef-40e0-9ea6-1e5c77140201",
+      "name": "Send Delivered",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        10140,
+        180
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "90bc6b94-3a10-43d4-89ef-5562689b5ec2"
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Delivery Summary').first().json.cleanupCmd }}"
+      },
+      "id": "bf6f7c5d-a0ca-4452-bdc6-dcf468f21409",
+      "name": "Cleanup",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        10400,
+        180
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = { ...$('Load Preview').first().json };\ndelete j.previewHtml; delete j.approvalText; delete j.previewSubject;\nreturn [{ json: j }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ff7f6d2d-8138-4156-82bf-324679d7a6d7",
+      "name": "Restore Job (Rejected)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8840,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendAndWait",
+        "sendTo": "={{ $json.requesterEmail }}",
+        "subject": "={{ 'What should change? ' + $json.storyboard.title }}",
+        "message": "Thanks for the review. Tell me what should change - I will regenerate only the affected scenes and send a new preview.",
+        "responseType": "customForm",
+        "options": {
+          "appendAttribution": false,
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 24,
+              "resumeUnit": "hours"
+            }
+          }
+        },
+        "defineForm": "fields",
+        "formTitle": "What should change?",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Decision",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Revise and regenerate"
+                  },
+                  {
+                    "option": "Cancel this job"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "What should change?",
+              "fieldType": "textarea",
+              "requiredField": true
+            }
+          ]
+        }
+      },
+      "id": "0999be96-e7ed-4322-a4f6-26f5985a373b",
+      "name": "Ask What To Change",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        9100,
+        720
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "c35e599e-392c-4843-9e14-4e77dc87579f"
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = { ...$('Restore Job (Rejected)').first().json };\nconst d = ($input.first().json || {}).data;\nconst get = (p) => { if (!d) return ''; const k = Object.keys(d).find((x) => x.toLowerCase().startsWith(p)); return k ? String(d[k] || '').trim() : ''; };\nconst decision = get('decision'), text = get('what should');\nlet revise = false, reason = '';\nif (!d) reason = 'No reply to the feedback request within the wait limit.';\nelse if (!/revise/i.test(decision)) reason = 'You chose to cancel this job.';\nelse if (!text) reason = 'No change instructions were provided.';\nelse if ((j.revisionRound || 0) >= j.cfg.revisionRoundsMax) reason = 'The maximum number of revision rounds (' + j.cfg.revisionRoundsMax + ') has been reached.';\nelse revise = true;\nj.revise = revise;\nif (revise) {\n  j.revisionRound = (j.revisionRound || 0) + 1;\n  j.revisionNotes = ['HUMAN FEEDBACK (revision ' + j.revisionRound + '): ' + text];\n  j.useFallback = false;\n  j.needAutoFix = false;\n}\nj.cancelMessage = 'Job ' + j.jobId + ' (\"' + ((j.storyboard && j.storyboard.title) || j.spec.title) + '\") was not saved to Drive. ' + reason;\nconst dir = j.jobDir;\nj.cleanupCmd = (!revise && j.cfg.cleanupAfter && /\\/video-jobs\\/job_[a-z0-9]+$/.test(dir)) ? 'rm -rf \"' + dir + '\"' : 'echo \"cleanup skipped\"';\nreturn [{ json: j }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "60ef11a0-616c-4dff-80c5-f8d7b723621a",
+      "name": "Parse Feedback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9360,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.revise }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "5f316a43-928b-46ec-a037-5f5f7ad4de55"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "912dd036-d8cd-4611-8701-2922c112f39a",
+      "name": "Revise?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        9620,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.requesterEmail }}",
+        "subject": "={{ 'Video not saved: ' + $json.spec.title }}",
+        "emailType": "text",
+        "message": "={{ $json.cancelMessage }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "6dcb4da7-d84f-402b-8816-eb84d75b67ec",
+      "name": "Notify Not Saved",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        9880,
+        900
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "1ebf8b99-2784-4764-82fd-d1855e0914b1"
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Parse Feedback').first().json.cleanupCmd }}"
+      },
+      "id": "b3d4d88f-d7cb-4420-b3fa-b9d2fb863e71",
+      "name": "Cleanup After Cancel",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        10140,
+        900
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## AI Video Factory - Veo 3.1\n**Setup (once)**\n1. Import `veo-scene-renderer.json` first and copy its workflow ID into the **Render Scene** node.\n2. Create credentials: *Header Auth* named **Gemini API Key** (name `x-goog-api-key`, value = your Gemini API key), a **Gmail OAuth2** and a **Google Drive OAuth2** credential, then select them on the nodes.\n3. Self-hosted env: `NODES_EXCLUDE=[]`, `NODE_FUNCTION_ALLOW_BUILTIN=fs,zlib`, ffmpeg + fonts in the container (see README).\n4. Edit global settings in **Init Job** (models, resolution, limits).\n5. Optional: set the error workflow in the workflow settings.",
+        "height": 330,
+        "width": 620,
+        "color": 4
+      },
+      "id": "7aac18c4-ac20-4358-ba66-0310cc0add6b",
+      "name": "Note 362a",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1 Intake\nForm (topic, brief, docs/images/media) -> files saved + text extracted -> Intake Analyst (Gemini) decides if duration/format/etc. are known. If not, an e-mail form asks the missing questions (max 2 rounds).",
+        "height": 200,
+        "width": 520,
+        "color": 7
+      },
+      "id": "b8f6b53b-7b51-4d79-a66f-fbff49ff6556",
+      "name": "Note 52b4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        260,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2 Research + Storyboard\nGoogle-Search grounded research -> Creative-Director planner writes the style bible, Veo-ready scene prompts (with dialogue/SFX), safe fallback prompts, reference-image plan. Fallback text model on failure.",
+        "height": 200,
+        "width": 520,
+        "color": 7
+      },
+      "id": "6c8f45ba-247d-4faf-8eaf-c586a2bf3d08",
+      "name": "Note 0265",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3 Render\nEach scene = one Veo clip, rendered by the sub-workflow with retries, backoff, model-tier fallback, still-image fallback. Prompt-hash cache means revisions only re-render changed scenes.",
+        "height": 200,
+        "width": 520,
+        "color": 7
+      },
+      "id": "e71ee433-2547-4e58-9918-2738c63de09d",
+      "name": "Note 37a7",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4940,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 4 Assemble + QA\nffmpeg normalises, stitches, burns captions, loudness-normalises, makes thumbnail + preview. A Gemini QA agent watches the preview and may trigger one automatic fix round.",
+        "height": 200,
+        "width": 520,
+        "color": 7
+      },
+      "id": "46537634-e45e-4c92-bdce-c1c45d4d03e3",
+      "name": "Note 37ec",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        5980,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 5 Human approval\nPreview e-mail + Approve/Needs-changes e-mail. Approved -> Google Drive folder (video, thumbnail, script, storyboard, manifest). Rejected -> feedback form -> targeted re-render (max 2 rounds).",
+        "height": 200,
+        "width": 520,
+        "color": 7
+      },
+      "id": "86a76b92-b44b-433b-b256-745bceba29bf",
+      "name": "Note 3ff9",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        8060,
+        720
+      ]
+    }
+  ],
+  "connections": {
+    "Video Request": {
+      "main": [
+        [
+          {
+            "node": "Init Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Job": {
+      "main": [
+        [
+          {
+            "node": "Process Uploads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Uploads": {
+      "main": [
+        [
+          {
+            "node": "Build Intake Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Intake Request": {
+      "main": [
+        [
+          {
+            "node": "Intake Analyst",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intake Analyst": {
+      "main": [
+        [
+          {
+            "node": "Parse Intake",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Intake": {
+      "main": [
+        [
+          {
+            "node": "Info Complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Info Complete?": {
+      "main": [
+        [
+          {
+            "node": "Research Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask Missing Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask Missing Info": {
+      "main": [
+        [
+          {
+            "node": "Merge Answers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Answers": {
+      "main": [
+        [
+          {
+            "node": "Build Intake Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Research Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Build Research Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Planner Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Research Request": {
+      "main": [
+        [
+          {
+            "node": "Research (Google Search)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Research (Google Search)": {
+      "main": [
+        [
+          {
+            "node": "Parse Research",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Research": {
+      "main": [
+        [
+          {
+            "node": "Build Planner Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Planner Request": {
+      "main": [
+        [
+          {
+            "node": "Storyboard Planner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Storyboard Planner": {
+      "main": [
+        [
+          {
+            "node": "Parse Storyboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Storyboard": {
+      "main": [
+        [
+          {
+            "node": "Planner Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Planner Retry?": {
+      "main": [
+        [
+          {
+            "node": "Build Planner Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Need Reference Images?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need Reference Images?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Ref Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Expand Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Ref Jobs": {
+      "main": [
+        [
+          {
+            "node": "Reference Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reference Image": {
+      "main": [
+        [
+          {
+            "node": "Collect Refs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Refs": {
+      "main": [
+        [
+          {
+            "node": "Expand Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand Scenes": {
+      "main": [
+        [
+          {
+            "node": "Render Scene",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Scene": {
+      "main": [
+        [
+          {
+            "node": "Collect Clips",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Clips": {
+      "main": [
+        [
+          {
+            "node": "Render Failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Failed?": {
+      "main": [
+        [
+          {
+            "node": "Notify Render Failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Assemble Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Assemble Script": {
+      "main": [
+        [
+          {
+            "node": "Assemble Video (ffmpeg)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Video (ffmpeg)": {
+      "main": [
+        [
+          {
+            "node": "Check Assembly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Assembly": {
+      "main": [
+        [
+          {
+            "node": "Build QA Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build QA Request": {
+      "main": [
+        [
+          {
+            "node": "QA Agent (watches the video)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QA Agent (watches the video)": {
+      "main": [
+        [
+          {
+            "node": "Evaluate QA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate QA": {
+      "main": [
+        [
+          {
+            "node": "Auto-Fix Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-Fix Needed?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Auto-Fix",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Auto-Fix": {
+      "main": [
+        [
+          {
+            "node": "Build Planner Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Preview": {
+      "main": [
+        [
+          {
+            "node": "Send Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Preview": {
+      "main": [
+        [
+          {
+            "node": "Request Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Approval": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Restore Job (Approved)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Restore Job (Rejected)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Job (Approved)": {
+      "main": [
+        [
+          {
+            "node": "Create Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "Load Deliverables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Deliverables": {
+      "main": [
+        [
+          {
+            "node": "Upload to Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload to Drive": {
+      "main": [
+        [
+          {
+            "node": "Delivery Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delivery Summary": {
+      "main": [
+        [
+          {
+            "node": "Send Delivered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Delivered": {
+      "main": [
+        [
+          {
+            "node": "Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Job (Rejected)": {
+      "main": [
+        [
+          {
+            "node": "Ask What To Change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask What To Change": {
+      "main": [
+        [
+          {
+            "node": "Parse Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Feedback": {
+      "main": [
+        [
+          {
+            "node": "Revise?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revise?": {
+      "main": [
+        [
+          {
+            "node": "Build Planner Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Not Saved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Not Saved": {
+      "main": [
+        [
+          {
+            "node": "Cleanup After Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "7ab816d5-4d98-4d78-9734-90d34abe8679",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "tags": []
+}

@@ -1,0 +1,92 @@
+{
+  "name": "AI Video Factory - Error Alert",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "02fee047-7579-4614-b2b6-e95523cb3678",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\nconst ex = e.execution || {};\nconst wf = e.workflow || {};\nconst msg = [\n  'Workflow: ' + (wf.name || '?'),\n  'Failed node: ' + (ex.lastNodeExecuted || '?'),\n  'Error: ' + ((ex.error && ex.error.message) || 'unknown'),\n  'Execution: ' + (ex.url || ex.id || '?'),\n  '', String((ex.error && ex.error.stack) || '').split('\\n').slice(0, 6).join('\\n')\n].join('\\n');\nreturn [{ json: { subject: 'n8n alert: ' + (wf.name || 'workflow') + ' failed', message: msg } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "53584516-10e3-48a2-9aff-531cb024046c",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "REPLACE_WITH_ADMIN_EMAIL",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.message }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "f2c09ee5-5fd4-4d5c-9365-2afd13e81387",
+      "name": "Email Admin",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        520,
+        0
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-oauth2",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "10e35637-07fb-4e53-8508-1e49e5d5f7ab"
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Email Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "3b29fdcd-fbba-44e4-9abb-138190c4c522",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "tags": []
+}

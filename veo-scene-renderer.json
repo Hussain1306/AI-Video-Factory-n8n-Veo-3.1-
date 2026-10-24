@@ -1,0 +1,883 @@
+{
+  "name": "Veo Scene Renderer (sub-workflow)",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "c5d80666-fda2-4eff-88d3-74a658c16def",
+      "name": "Start",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst st = {\n  tierIdx: 0, tierTries: 0, softened: 0, blockRetried: false, polls: 0, pollErrors: 0, dlTries: 0, dropImages: false,\n  errors: [], attempts: 0, waitSec: j.needsRender ? Math.max(1, j.cfg.scenePaceSec || 8) : 1, opName: null, pollStart: 0, videoUri: null\n};\nreturn [{ json: { ...j, st } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "53c221ad-018a-403b-affe-b32833c4f470",
+      "name": "Init State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst j = $input.first().json;\nconst st = { ...j.st };\nconst base = { ...j };\n['submit', 'mode', 'route', 'result', 'tier'].forEach((k) => delete base[k]);\nif (!j.needsRender) return [{ json: { ...base, st, mode: 'cached' } }];\nconst tier = j.tiers[st.tierIdx];\nif (!tier || st.attempts > 40) return [{ json: { ...base, st, mode: 'fail' } }];\nif (tier.model === 'still') return [{ json: { ...base, st, tier, mode: 'still' } }];\n\nst.attempts++;\nconst ord = { '720p': 1, '1080p': 2, '4k': 3 };\nlet res = j.resolution;\nif (ord[res] > ord[tier.maxRes]) res = tier.maxRes;\nconst prompt = (st.softened > 0 && j.scene.safeVisualPrompt) ? j.scene.safeVisualPrompt : j.scene.visualPrompt;\nconst paths = st.dropImages ? [] : (j.imagePaths || []);\nconst useRefs = j.imageMode === 'reference' && tier.supportsRefs && paths.length > 0;\nconst useFirst = !useRefs && paths.length > 0 && (j.imageMode === 'first_frame' || (j.imageMode === 'reference' && !tier.supportsRefs));\nlet d = j.scene.durationSec;\nif (useRefs || res !== '720p') d = 8;\nconst img = (p) => {\n  const ext = p.split('.').pop().toLowerCase();\n  const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';\n  return { inlineData: { mimeType: mime, data: fs.readFileSync(p).toString('base64') } };\n};\nconst inst = { prompt };\nif (useRefs) inst.referenceImages = paths.slice(0, 3).map((p) => ({ image: img(p), referenceType: 'asset' }));\nelse if (useFirst) inst.image = img(paths[0]);\nconst body = { instances: [inst], parameters: { aspectRatio: j.aspectRatio, resolution: res, durationSeconds: d } };\nreturn [{ json: { ...base, st, tier, mode: 'veo', submit: { url: 'https://generativelanguage.googleapis.com/v1beta/models/' + tier.model + ':predictLongRunning', body } } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "20074685-704b-400f-829d-c0f9e9d44508",
+      "name": "Plan Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "a466a461-6a9f-49a7-8f9e-e1eb9ef79a14",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "veo",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "veo"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "db341c14-8676-4b68-92f6-5ec73d1bd59c",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "still",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "still"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9a3ffea6-20a5-41af-97ab-ee0aa10d128b",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "cached",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cached"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "052dd3d9-1ab8-4e41-a211-b2bf12c3aab3",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "fail",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "fail"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "36d0bd36-dc15-436f-8501-19d0fd918c12",
+      "name": "Mode",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        780,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.max(1, Math.round($json.st.waitSec || 1)) }}",
+        "unit": "seconds"
+      },
+      "id": "0ddbc034-177a-47ab-9dd9-ca3ba37a6fcc",
+      "name": "Pace Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        0
+      ],
+      "webhookId": "0c4f3676-998c-496d-832a-e56d397ffe0e"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.submit.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.submit.body) }}",
+        "options": {
+          "timeout": 180000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "17b5ff13-10bb-4762-a1b9-1ae134e5835c",
+      "name": "Veo Submit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Plan Attempt').first().json;\nconst r = $input.first().json || {};\nconst st = { ...prev.st };\nconst cfg = prev.cfg;\nconst base = { ...prev };\n['submit', 'mode'].forEach((k) => delete base[k]);\nconst code = Number(r.statusCode) || 0;\nconst body = r.body && typeof r.body === 'object' ? r.body : {};\nconst msg = String((body.error && (body.error.message || body.error.status)) || r.error || r.statusMessage || '').slice(0, 300);\nconst hint = (() => {\n  try {\n    const d = (body.error && body.error.details) || [];\n    for (const x of d) if (x.retryDelay) { const m = String(x.retryDelay).match(/([\\d.]+)s/); if (m) return Math.min(60, parseFloat(m[1])); }\n  } catch (e) { /* ignore */ }\n  const ra = r.headers && (r.headers['retry-after'] || r.headers['Retry-After']);\n  return ra ? Math.min(60, parseFloat(ra) || 0) : 0;\n})();\nconst backoff = (n) => Math.min(cfg.backoffMaxSec, Math.max(hint, cfg.backoffBaseSec * Math.pow(2, Math.max(0, n - 1)))) * (0.8 + Math.random() * 0.4);\nconst log = (w) => st.errors.push('tier' + st.tierIdx + ' (' + (prev.tier && prev.tier.model) + ') ' + w + (msg ? ': ' + msg : ''));\nconst nextTier = (w) => { log(w + ' -> next tier'); st.tierIdx++; st.tierTries = 0; st.dropImages = false; st.blockRetried = false; st.waitSec = 3; return 'replan'; };\nconst retrySame = (w) => { log(w + ' -> retry'); st.tierTries++; if (st.tierTries > cfg.maxSubmitRetriesPerTier) return nextTier('retries exhausted'); st.waitSec = Math.max(1, Math.round(backoff(st.tierTries))); return 'replan'; };\nconst safety = /safety|blocked|violat|prohibit|sensitive|filter|policy|responsible ai|celebrit|minor|child/i.test(msg);\nlet route;\nif (code >= 200 && code < 300 && body.name) { st.opName = body.name; st.polls = 0; st.pollErrors = 0; st.dlTries = 0; st.pollStart = Date.now(); st.waitSec = cfg.pollIntervalSec; route = 'poll'; }\nelse if (code === 429) route = retrySame('rate limited (429)');\nelse if (code >= 500 || code === 0) route = retrySame('server/network error ' + code);\nelse if (code === 401 || (code === 403 && /api key|api_key/i.test(msg))) { log('authentication failed - cannot continue'); st.tierIdx = 999; route = 'replan'; }\nelse if (code === 404 || code === 403) route = nextTier('model unavailable (' + code + ')');\nelse if (code === 400) {\n  if (safety && st.softened < cfg.maxPromptSoftenings && prev.scene.safeVisualPrompt) { log('blocked by safety -> softened prompt'); st.softened++; st.waitSec = 3; route = 'replan'; }\n  else if (safety) route = nextTier('blocked by safety');\n  else if ((prev.imagePaths || []).length && !st.dropImages) { log('bad request -> retry without images'); st.dropImages = true; st.waitSec = 3; route = 'replan'; }\n  else route = nextTier('bad request');\n} else route = nextTier('unexpected status ' + code);\nreturn [{ json: { ...base, st, route } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "a860af07-b889-411d-a02e-eb7fb2ce6197",
+      "name": "After Submit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "a49eb537-4516-4081-8fc0-8264c68bfa40",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "poll",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "poll"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "fabddd1f-971b-4a8d-b2b4-eb67e3ce9c22",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "replan",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "replan"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "bec7eb4a-4815-4631-bd3e-fc303d458281",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "download",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "download"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4a43b493-9442-48d2-b646-bd0bd60c6b67",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "done",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "done"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d13c2edb-7469-4000-a866-1d1b1419d88d",
+      "name": "Route Attempt",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1820,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.max(1, Math.round($json.st.waitSec || 15)) }}",
+        "unit": "seconds"
+      },
+      "id": "4911b89a-a839-4ef4-b16e-daf5de412c2a",
+      "name": "Poll Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2080,
+        0
+      ],
+      "webhookId": "b7bd3b05-ae19-4167-8972-8f1b66bfba20"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/' + $json.st.opName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "517ee5ac-c002-4e67-931c-240c78ce92b4",
+      "name": "Veo Poll",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2340,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Poll Wait').first().json;\nconst r = $input.first().json || {};\nconst st = { ...prev.st };\nconst cfg = prev.cfg;\nconst base = { ...prev };\ndelete base.route;\nconst code = Number(r.statusCode) || 0;\nconst b = r.body && typeof r.body === 'object' ? r.body : {};\nconst msg = String((b.error && (b.error.message || b.error.status)) || r.error || '').slice(0, 300);\nconst log = (w) => st.errors.push('tier' + st.tierIdx + ' (' + (prev.tier && prev.tier.model) + ') ' + w + (msg ? ': ' + msg : ''));\nconst backoff = (n) => Math.min(cfg.backoffMaxSec, cfg.backoffBaseSec * Math.pow(2, Math.max(0, n - 1))) * (0.8 + Math.random() * 0.4);\nconst nextTier = (w) => { log(w + ' -> next tier'); st.tierIdx++; st.tierTries = 0; st.dropImages = false; st.blockRetried = false; st.waitSec = 3; return 'replan'; };\nconst retrySame = (w) => { log(w + ' -> retry'); st.tierTries++; if (st.tierTries > cfg.maxSubmitRetriesPerTier) return nextTier('retries exhausted'); st.waitSec = Math.max(1, Math.round(backoff(st.tierTries))); return 'replan'; };\nconst blocked = (w) => {\n  if (!st.blockRetried) { st.blockRetried = true; log(w + ' -> one plain retry'); st.waitSec = 3; return 'replan'; }\n  if (st.softened < cfg.maxPromptSoftenings && prev.scene.safeVisualPrompt) { log(w + ' -> softened prompt'); st.softened++; st.waitSec = 3; return 'replan'; }\n  return nextTier(w);\n};\nst.polls++;\nlet route;\nif (code === 200 && b.done) {\n  if (b.error) {\n    const em = String(b.error.message || '') + ' ' + String(b.error.status || '');\n    if (/safety|blocked|violat|prohibit|sensitive|filter|policy|audio/i.test(em)) route = blocked('operation blocked');\n    else if (/resource_exhausted|quota|rate/i.test(em) || b.error.code === 8 || b.error.code === 429) route = retrySame('operation rate limited');\n    else route = retrySame('operation failed');\n  } else {\n    const resp = b.response && (b.response.generateVideoResponse || b.response);\n    const sample = resp && resp.generatedSamples && resp.generatedSamples[0];\n    const uri = sample && sample.video && sample.video.uri;\n    if (uri) { st.videoUri = uri; route = 'download'; }\n    else route = blocked('no video returned (filtered: ' + JSON.stringify((resp && resp.raiMediaFilteredReasons) || []).slice(0, 120) + ')');\n  }\n} else if (code === 200) {\n  if (Date.now() - st.pollStart > cfg.maxPollMinutes * 60000) route = nextTier('poll timeout');\n  else { st.waitSec = Math.min(30, cfg.pollIntervalSec + Math.floor(st.polls / 6) * 5); route = 'poll'; }\n} else if (code === 404) route = retrySame('operation not found');\nelse if (code === 429 || code >= 500 || code === 0) {\n  st.pollErrors++;\n  if (st.pollErrors > 8) route = nextTier('polling kept failing');\n  else { st.waitSec = Math.min(60, cfg.pollIntervalSec * 2); route = 'poll'; }\n} else route = nextTier('poll error ' + code);\nreturn [{ json: { ...base, st, route } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "baecf7a5-96fe-4cbf-ba58-4cdf5cf50884",
+      "name": "After Poll",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.st.videoUri }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 600000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "0d224a79-0ba6-449f-8d6c-eea586784e86",
+      "name": "Download Clip",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2080,
+        360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst prev = $('After Poll').first().json;\nconst st = { ...prev.st };\nconst cfg = prev.cfg;\nconst base = { ...prev };\ndelete base.route;\nconst r = $input.first();\nconst code = Number((r.json || {}).statusCode) || 0;\nlet saved = false;\nif (code === 200 && r.binary && r.binary.data) {\n  const buf = await this.helpers.getBinaryDataBuffer(0, 'data');\n  if (buf.length > 20000 && buf.subarray(4, 8).toString('latin1') === 'ftyp') {\n    fs.mkdirSync(prev.jobDir + '/clips', { recursive: true });\n    fs.writeFileSync(prev.outPath, buf);\n    saved = true;\n  }\n}\nif (saved) {\n  return [{ json: { ...base, st, route: 'done', result: { status: 'ok', sceneIndex: prev.sceneIndex, clipPath: prev.outPath, source: 'veo', model: prev.tier && prev.tier.model, attempts: st.attempts, errors: st.errors } } }];\n}\nst.dlTries++;\nst.errors.push('download failed (status ' + code + ') try ' + st.dlTries);\nif (st.dlTries <= 3) { st.waitSec = 10; return [{ json: { ...base, st, route: 'poll' } }]; }\nst.tierIdx++; st.tierTries = 0; st.dlTries = 0; st.waitSec = 3;\nreturn [{ json: { ...base, st, route: 'replan' } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "9bdf4942-619d-46f9-92f2-9b108b52774d",
+      "name": "Save Clip",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \"Result OK\": the finished scene result is already attached by Save Clip\nreturn [{ json: $input.first().json.result }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "70611a5f-73e8-45bf-91e7-a8563ea2485e",
+      "name": "Result OK",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst m = j.cachedMeta || {};\nreturn [{ json: { status: 'cached', sceneIndex: j.sceneIndex, clipPath: j.cachedPath, source: m.source || 'veo', model: m.model || '', attempts: 0, errors: [] } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "3f9b41d5-9ecf-4bec-ad52-8e711ca37f60",
+      "name": "Result Cached",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nreturn [{ json: { status: 'failed', sceneIndex: j.sceneIndex, source: null, attempts: (j.st && j.st.attempts) || 0, errors: ((j.st && j.st.errors) || []).concat(j.stillError ? [j.stillError] : []) } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "003845fc-55d1-46ea-8d50-f90100b4eca3",
+      "name": "Result Failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst prompt = 'Create ONE cinematic still frame for a video scene, aspect ratio ' + j.aspectRatio + ', no text, no watermark. Scene: ' + j.scene.visualPrompt.replace(/\"[^\"]*\"/g, '').slice(0, 1500);\nconst reqBody = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } };\nreturn [{ json: { ...j, imgModel: j.cfg.imageModel, reqBody } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "1173eba0-77e0-4c2f-b776-6b65db0b1890",
+      "name": "Still Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + $json.imgModel + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reqBody) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "d3c3e63f-c66d-469b-a576-27860fc53e92",
+      "name": "Still Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        900
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "gemini-api-key",
+          "name": "Gemini API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst req = $('Still Request').first().json;\nconst r = $input.first().json || {};\nconst base = { ...req };\ndelete base.reqBody; delete base.imgModel;\ntry {\n  const parts = r.candidates[0].content.parts || [];\n  const p = parts.find((x) => x.inlineData || x.inline_data);\n  const d = p.inlineData || p.inline_data;\n  const dir = base.jobDir + '/work';\n  fs.mkdirSync(dir, { recursive: true });\n  const img = dir + '/still_' + base.sceneIndex + '.png';\n  fs.writeFileSync(img, Buffer.from(d.data, 'base64'));\n  const dims = { '720p': [1280, 720], '1080p': [1920, 1080], '4k': [3840, 2160] }[base.resolution] || [1280, 720];\n  const vertical = base.aspectRatio === '9:16';\n  const W = vertical ? dims[1] : dims[0], H = vertical ? dims[0] : dims[1];\n  const fps = base.cfg.fps || 24, secs = base.scene.durationSec, frames = secs * fps;\n  const vf = \"scale=\" + (W * 2) + \":\" + (H * 2) + \":force_original_aspect_ratio=increase,crop=\" + (W * 2) + \":\" + (H * 2) + \",zoompan=z='min(zoom+0.0007,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=\" + frames + \":s=\" + W + \"x\" + H + \":fps=\" + fps + \",format=yuv420p\";\n  const cmd = 'ffmpeg -hide_banner -loglevel error -y -i \"' + img + '\" -f lavfi -i anullsrc=r=48000:cl=stereo -vf \"' + vf + '\" -t ' + secs + ' -shortest -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k -ar 48000 -ac 2 \"' + base.outPath + '\"';\n  return [{ json: { ...base, ok: true, cmd } }];\n} catch (e) {\n  return [{ json: { ...base, ok: false, cmd: 'true', stillError: 'still image fallback failed: ' + (r.error ? 'API error' : e.message) } }];\n}\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "508e4a95-acea-45ba-a436-40568f5d86bb",
+      "name": "Still Clip",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "id": "20ca366b-1e45-41ab-8476-3aff97e7a7af"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a76b1ca5-434b-43e4-92bb-2a7c131284fa",
+      "name": "Still OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1820,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.cmd }}"
+      },
+      "id": "b1796fdb-4687-497c-b5dc-e22af2fad782",
+      "name": "Still FFmpeg",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        900
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst prev = $('Still Clip').first().json;\nconst st = { ...prev.st };\nif (fs.existsSync(prev.outPath) && fs.statSync(prev.outPath).size > 5000) {\n  return [{ json: { status: 'ok', sceneIndex: prev.sceneIndex, clipPath: prev.outPath, source: 'still', model: prev.cfg.imageModel + ' + ffmpeg', attempts: st.attempts, errors: st.errors } }];\n}\nreturn [{ json: { status: 'failed', sceneIndex: prev.sceneIndex, source: null, attempts: st.attempts, errors: st.errors.concat(['still-image ffmpeg failed']) } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "a9b85c49-eb97-4fd7-8563-bb9fa4c398dd",
+      "name": "Still Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Veo Scene Renderer\nCalled once per scene by the main workflow (sequentially, which also paces the Veo API).\n\n**Flow**: plan attempt -> submit (Veo predictLongRunning) -> poll -> download -> save.\n**Fallbacks**: 429/5xx backoff with jitter -> softened prompt on safety blocks -> retry without images -> next model tier (Veo 3.1 -> Fast -> Lite) -> animated still image (Gemini image + ffmpeg Ken-Burns) -> report failure.\nTier order and limits come from the Init Job node of the main workflow.",
+        "height": 260,
+        "width": 520,
+        "color": 7
+      },
+      "id": "aa44526a-7ff9-4151-aa59-e1f39ca8292c",
+      "name": "Note 7393",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        720
+      ]
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Init State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init State": {
+      "main": [
+        [
+          {
+            "node": "Plan Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Attempt": {
+      "main": [
+        [
+          {
+            "node": "Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mode": {
+      "main": [
+        [
+          {
+            "node": "Pace Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Still Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result Cached",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pace Wait": {
+      "main": [
+        [
+          {
+            "node": "Veo Submit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Veo Submit": {
+      "main": [
+        [
+          {
+            "node": "After Submit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "After Submit": {
+      "main": [
+        [
+          {
+            "node": "Route Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Attempt": {
+      "main": [
+        [
+          {
+            "node": "Poll Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Plan Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Download Clip",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Wait": {
+      "main": [
+        [
+          {
+            "node": "Veo Poll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Veo Poll": {
+      "main": [
+        [
+          {
+            "node": "After Poll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "After Poll": {
+      "main": [
+        [
+          {
+            "node": "Route Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Clip": {
+      "main": [
+        [
+          {
+            "node": "Save Clip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Clip": {
+      "main": [
+        [
+          {
+            "node": "Route Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still Request": {
+      "main": [
+        [
+          {
+            "node": "Still Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still Image": {
+      "main": [
+        [
+          {
+            "node": "Still Clip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still Clip": {
+      "main": [
+        [
+          {
+            "node": "Still OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still OK?": {
+      "main": [
+        [
+          {
+            "node": "Still FFmpeg",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still FFmpeg": {
+      "main": [
+        [
+          {
+            "node": "Still Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "d287653c-3809-49d4-aa05-93abde0c12bc",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "tags": []
+}
